@@ -795,12 +795,18 @@ ignored_paths: set[str] = set()
 unsupported_paths: set[str] = set()
 
 ignored_prefixes = (
+    ".buildkite/",
     ".github/",
     "benchmarks/",
     "docs/",
     "examples/",
     "tests/",
 )
+ignored_files = {
+    # setup.py is source-tree packaging metadata and is not present beside an
+    # installed wheel. Runtime PR application never installs dependency changes.
+    "setup.py",
+}
 native_suffixes = {
     ".a",
     ".c",
@@ -833,7 +839,11 @@ for line in patch_file.read_text(errors="replace").splitlines():
         path = raw_path[2:] if raw_path.startswith(("a/", "b/")) else raw_path
         if path == "/dev/null":
             continue
-        if path.startswith(ignored_prefixes) or Path(path).suffix.lower() in {".md", ".rst"}:
+        if (
+            path.startswith(ignored_prefixes)
+            or path in ignored_files
+            or Path(path).suffix.lower() in {".md", ".rst"}
+        ):
             ignored_paths.add(path)
         elif path.startswith("vllm/"):
             name = Path(path).name
@@ -863,7 +873,8 @@ if not runtime_paths:
 
 print(
     f"Validated vLLM PR #{pr_number} for runtime application: "
-    f"{len(runtime_paths)} package path(s), {len(ignored_paths)} test/docs path(s) ignored."
+    f"{len(runtime_paths)} package path(s), "
+    f"{len(ignored_paths)} non-runtime path(s) ignored."
 )
 PY
 }
@@ -1284,7 +1295,7 @@ container_keepalive_command() {
 }
 
 # Verify that the selected image resolves to the same content-addressable image
-# ID on the head and every worker before starting any containers.
+# on the head and every worker before starting any containers.
 verify_cluster_image_consistency() {
     if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
         return 0
@@ -1292,32 +1303,42 @@ verify_cluster_image_consistency() {
 
     echo "Verifying Docker image consistency across cluster nodes..."
 
-    local head_image_id
-    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+    local image_inspect_format='{{.Id}}|{{.Created}}|{{range .RootFS.Layers}}{{.}};{{end}}'
+    local head_image_signature
+    if ! head_image_signature=$(docker image inspect --format "$image_inspect_format" "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_signature" ]]; then
         echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
         echo "       Make sure the image exists and is accessible to the current user."
         return 1
     fi
+    local head_image_id="${head_image_signature%%|*}"
+    local head_image_fingerprint="${head_image_signature#*|}"
     echo "  [HEAD] $HEAD_IP: $head_image_id"
 
     local inspect_cmd
-    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+    printf -v inspect_cmd "docker image inspect --format %q %q" "$image_inspect_format" "$IMAGE_NAME"
 
     local worker
-    local worker_image_id
+    local worker_image_signature
     local image_error=false
     for worker in "${PEER_NODES[@]}"; do
-        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+        if ! worker_image_signature=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_signature" ]]; then
             echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
             echo "       The image may be missing or inaccessible to the remote user."
             image_error=true
-        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            continue
+        fi
+
+        local worker_image_id="${worker_image_signature%%|*}"
+        local worker_image_fingerprint="${worker_image_signature#*|}"
+        if [[ "$worker_image_id" == "$head_image_id" ]]; then
+            echo "  [WORKER] $worker: $worker_image_id (match)"
+        elif [[ -n "$head_image_fingerprint" && "$worker_image_fingerprint" == "$head_image_fingerprint" ]]; then
+            echo "  [WORKER] $worker: $worker_image_id (RootFS match; Docker ID metadata differs)"
+        else
             echo "Error: Docker image mismatch on worker node ($worker):"
             echo "       Head:   $head_image_id"
             echo "       Worker: $worker_image_id"
             image_error=true
-        else
-            echo "  [WORKER] $worker: $worker_image_id (match)"
         fi
     done
 
