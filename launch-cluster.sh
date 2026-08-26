@@ -79,7 +79,7 @@ usage() {
     echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
     echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
     echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
-    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
+    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.cache/cute_dsl, ~/.triton, ~/.tilelang)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
     echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
     echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
@@ -418,17 +418,12 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
     CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
 
-    # CuTeDSL Cache
-    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cute_dsl:/root/.cache/cute_dsl"
-    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cute_dsl")
-
-    # Cutlass Cache
-    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cutlass:/root/.cache/cutlass"
-    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cutlass")
-
-    # B12X Cache
+    # B12X / CuTeDSL JIT compile caches (runtime-compiled kernels)
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x:/root/.cache/b12x"
     CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x")
+
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cute_dsl:/root/.cache/cute_dsl"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cute_dsl")
 fi
 
 # Pass user-provided mappings through unchanged so Docker handles its native
