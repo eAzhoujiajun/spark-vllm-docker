@@ -417,6 +417,18 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # TileLang Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
     CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
+
+    # CuTeDSL Cache
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cute_dsl:/root/.cache/cute_dsl"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cute_dsl")
+
+    # Cutlass Cache
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cutlass:/root/.cache/cutlass"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cutlass")
+
+    # B12X Cache
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x:/root/.cache/b12x"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x")
 fi
 
 # Pass user-provided mappings through unchanged so Docker handles its native

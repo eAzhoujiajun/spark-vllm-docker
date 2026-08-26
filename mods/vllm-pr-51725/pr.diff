@@ -1,0 +1,228 @@
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 0e46f54f6f59..ccd0cf3e9333 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -1280,6 +1280,30 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
+     assert scheduler.reset_prefix_cache(reset_connector=True) is True
+ 
+ 
++def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
++    (tmp_path / "config.json").write_text(
++        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
++    )
++    scheduler = create_scheduler(
++        model=str(tmp_path),
++        max_num_seqs=16,
++        max_num_batched_tokens=20,
++        num_speculative_tokens=4,
++        parallel_drafting=True,
++        skip_tokenizer_init=True,
++    )
++    speculative_config = scheduler.vllm_config.speculative_config
++    assert speculative_config is not None
++    assert scheduler.max_num_scheduled_tokens == 20
++    assert speculative_config.max_num_new_slots_for_drafting == 3
++
++    for request in create_requests(num_requests=2, num_tokens=10):
++        scheduler.add_request(request)
++
++    assert scheduler.schedule().num_scheduled_tokens == {"0": 10, "1": 4}
++
++
+ # Note - these test cases mirror some of those in test_rejection_sampler.py
+ @pytest.mark.parametrize(
+     "spec_tokens,output_tokens,expected",
+diff --git a/tests/v1/core/utils.py b/tests/v1/core/utils.py
+index 5807574c6444..0baa68af2589 100644
+--- a/tests/v1/core/utils.py
++++ b/tests/v1/core/utils.py
+@@ -61,6 +61,7 @@ def create_scheduler(
+     max_model_len: int | None = None,
+     num_speculative_tokens: int | None = None,
+     speculative_method: str | None = None,
++    parallel_drafting: bool = False,
+     skip_tokenizer_init: bool = False,
+     async_scheduling: bool = False,
+     pipeline_parallel_size: int = 1,
+@@ -151,6 +152,7 @@ def create_scheduler(
+             spec_kwargs["prompt_lookup_max"] = num_speculative_tokens
+             spec_kwargs["prompt_lookup_min"] = 1
+         speculative_config = SpeculativeConfig(**spec_kwargs)
++        speculative_config.parallel_drafting = parallel_drafting
+ 
+     ec_transfer_config = (
+         ECTransferConfig(
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 454514f0f205..343feba36c52 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1782,21 +1782,15 @@ def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
+     def _set_max_num_scheduled_tokens(self):
+         """
+         In most cases, the scheduler may schedule a batch with as many tokens as the
+-        worker is configured to handle. However for some speculative decoding methods,
+-        the drafter model may insert additional slots into the batch when drafting.
+-        To account for this, we need to decrease the max_num_scheduled_tokens by an
+-        upper bound on the number of slots that can be added.
++        worker is configured to handle.
+         """
+         if self.speculative_config is not None:
+             scheduled_token_delta = (
+                 self.speculative_config.max_num_new_slots_for_drafting
+-                * self.scheduler_config.max_num_seqs
+             )
+             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+             if self.scheduler_config.max_num_scheduled_tokens is None:
+-                self.scheduler_config.max_num_scheduled_tokens = (
+-                    max_num_batched_tokens - scheduled_token_delta
+-                )
++                self.scheduler_config.max_num_scheduled_tokens = max_num_batched_tokens
+ 
+             if self.scheduler_config.max_num_scheduled_tokens <= 0:
+                 raise ValueError(
+@@ -1805,7 +1799,7 @@ def _set_max_num_scheduled_tokens(self):
+                     " the speculative decoding settings, which does not allow"
+                     " any tokens to be scheduled. Increase max_num_batched_tokens"
+                     " to accommodate the additional draft token slots, or decrease"
+-                    " num_speculative_tokens or max_num_seqs."
++                    " num_speculative_tokens."
+                 )
+             if self.scheduler_config.max_num_scheduled_tokens < 8192:
+                 logger.warning_once(
+@@ -1814,19 +1808,14 @@ def _set_max_num_scheduled_tokens(self):
+                     " the speculative decoding settings. This may lead to suboptimal"
+                     " performance. Consider increasing max_num_batched_tokens to"
+                     " accommodate the additional draft token slots, or decrease"
+-                    " num_speculative_tokens or max_num_seqs.",
++                    " num_speculative_tokens.",
+                 )
+ 
+-            max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
+-            if max_num_batched_tokens < max_num_scheduled_tokens + (
+-                self.speculative_config.max_num_new_slots_for_drafting
+-                * self.scheduler_config.max_num_seqs
+-            ):
++            if max_num_batched_tokens <= scheduled_token_delta:
+                 raise ValueError(
+-                    f"VllmConfig received max_num_scheduled_tokens but it does not have"
+-                    " enough slots to support the speculative decoding settings."
+-                    f" It should be greater by at least {scheduled_token_delta}, but"
+-                    f" got {max_num_batched_tokens=} and {max_num_scheduled_tokens=}."
++                    "VllmConfig does not have enough slots to schedule a token and"
++                    " support the speculative decoding settings."
++                    f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
+                 )
+ 
+     def _set_cudagraph_sizes(self):
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c08a1302131e..a781b4580149 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -456,6 +456,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+         num_scheduled_tokens: dict[str, int] = {}
+         token_budget = self.max_num_scheduled_tokens
++        spec = self.vllm_config.speculative_config
++        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
++        input_budget = self.scheduler_config.max_num_batched_tokens
+         if self._pause_state == PauseState.PAUSED_ALL:
+             # Do not schedule any requests when paused.
+             token_budget = 0
+@@ -483,6 +486,8 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++            if input_budget <= draft_slots:
++                break
+ 
+             if (
+                 request.num_output_placeholders > 0
+@@ -519,7 +524,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+             )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+-            num_new_tokens = min(num_new_tokens, token_budget)
++            num_new_tokens = min(
++                num_new_tokens, token_budget, input_budget - draft_slots
++            )
+ 
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
+@@ -605,7 +612,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id
+                             scheduled_running_reqs.remove(preempted_req)
+-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
++                            restored = num_scheduled_tokens.pop(preempted_req_id)
++                            token_budget += restored
++                            input_budget += restored + draft_slots
+                             req_to_new_blocks.pop(preempted_req_id)
+                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+@@ -643,6 +652,7 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
++            input_budget -= num_new_tokens + draft_slots
+             req_index += 1
+ 
+             # Speculative decode related.
+@@ -693,6 +703,8 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+             step_skipped_waiting = create_request_queue(self.policy)
+ 
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
++                if input_budget <= draft_slots:
++                    break
+                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                 # in `running` but still hold a model-runner request slot.
+                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+@@ -866,6 +878,7 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                     # compute to a cadence-aligned step.
+                     break
+                 else:
++                    request_token_budget = min(token_budget, input_budget - draft_slots)
+                     # Number of tokens to be scheduled.
+                     # We use `request.num_tokens` instead of
+                     # `request.num_prompt_tokens` to consider the resumed
+@@ -883,7 +896,7 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                     ):
+                         num_new_tokens = 1 + self.num_spec_tokens
+                         if (
+-                            num_new_tokens > token_budget
++                            num_new_tokens > request_token_budget
+                             or num_computed_tokens + num_new_tokens > self.max_model_len
+                         ):
+                             # Prefer to not schedule than schedule un-padded here.
+@@ -898,13 +911,13 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                     # pooling requests to be chunked
+                     if (
+                         not self.scheduler_config.enable_chunked_prefill
+-                        and num_new_tokens > token_budget
++                        and num_new_tokens > request_token_budget
+                     ):
+                         # If chunked_prefill is disabled,
+                         # we can stop the scheduling here.
+                         break
+ 
+-                    num_new_tokens = min(num_new_tokens, token_budget)
++                    num_new_tokens = min(num_new_tokens, request_token_budget)
+                     assert num_new_tokens > 0
+ 
+                     # Apply Mamba alignment before encoder caps.
+@@ -1065,6 +1078,7 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
++                input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 if pad_spec_decode:
+@@ -1104,6 +1118,7 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+ 
+         assert token_budget >= 0
++        assert input_budget >= 0
+         assert len(self.running) <= self.max_num_running_reqs
+         # Since some requests in the RUNNING queue may not be scheduled in
+         # this step, the total number of scheduled requests can be smaller than
