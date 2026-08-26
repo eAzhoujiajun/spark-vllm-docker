@@ -16,8 +16,6 @@ cluster_only: true
 mods:
   - mods/instanttensor-hybrid-draft-loader
   - mods/fix-decode-topk-cache
-  - mods/vllm-pr-51725
-  - mods/vllm-pr-51726
 #   - mods/drop-caches
 
 defaults:
