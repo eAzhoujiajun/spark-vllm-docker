@@ -311,6 +311,31 @@ test_dry_run_generates_script() {
     fi
 }
 
+test_deepseek_vision_auto_warmup() {
+    log_test "DeepSeek Vision recipe runs automatic prefill warmup"
+
+    output=$(run_recipe_dry_run "deepseek-v4-flash-vision-exp-full" "cluster")
+
+    if ! echo "$output" | grep -q \
+        "Post-launch: examples/warmup-deepseek-v4-prefill.sh"; then
+        log_fail "DeepSeek Vision post-launch warmup is missing"
+        return
+    fi
+    if ! grep -q \
+        'default="512,1024,2048,4096,8192,16384,32768,65536,131072"' \
+        "$PROJECT_DIR/examples/warmup-deepseek-v4-prefill.py"; then
+        log_fail "DeepSeek Vision warmup does not include 131072 tokens"
+        return
+    fi
+    if ! echo "$output" | grep -q \
+        '"num_speculative_tokens":6,"draft_sample_method":"probabilistic"'; then
+        log_fail "DeepSeek Vision draft configuration changed"
+        return
+    fi
+
+    log_pass "DeepSeek Vision auto-warmup covers 131072 with original draft mode"
+}
+
 # Test: Solo mode sets tensor_parallel=1
 test_solo_mode_tp1() {
     log_test "Solo mode sets tensor_parallel=1"
@@ -1598,6 +1623,7 @@ main() {
     
     # Dry-run tests
     test_dry_run_generates_script
+    test_deepseek_vision_auto_warmup
     test_solo_mode_tp1
     test_solo_mode_removes_ray
     test_solo_mode_rejects_backend_flags

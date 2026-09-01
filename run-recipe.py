@@ -67,6 +67,7 @@ RECIPE YAML SCHEMA:
     defaults: dict         # Optional: Default values for command placeholders
     env: dict              # Optional: Environment variables
     build_args: list[str]  # Optional: Args for build-and-copy.sh
+    post_launch: list[str] # Optional: Host command started alongside launch
     cluster_only: bool     # Optional: Require cluster mode (default: false)
     solo_only: bool        # Optional: Require solo mode (default: false)
 
@@ -229,8 +230,16 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("mods", [])
     recipe.setdefault("defaults", {})
     recipe.setdefault("env", {})
+    recipe.setdefault("post_launch", [])
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+
+    post_launch = recipe["post_launch"]
+    if not isinstance(post_launch, list) or not all(
+        isinstance(value, str) and value for value in post_launch
+    ):
+        print("Error: Recipe post_launch must be a list of non-empty strings")
+        sys.exit(1)
 
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -1198,6 +1207,8 @@ Examples:
             print("Non-privileged mode: Yes")
         if cli_vllm_prs:
             print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
+        if recipe.get("post_launch"):
+            print(f"Post-launch: {' '.join(recipe['post_launch'])}")
         print()
 
     # --- Build Phase ---
@@ -1411,6 +1422,12 @@ Examples:
         print(" ".join(cmd_parts))
         print()
         print("3. The launch script runs inside the container")
+        if recipe.get("post_launch"):
+            print()
+            print(
+                "4. Post-launch command runs while the server starts: "
+                + " ".join(recipe["post_launch"])
+            )
         return 0
 
     # Write temporary launch script
@@ -1519,8 +1536,31 @@ Examples:
             print("Mode: Solo")
         print()
 
-        # Execute
+        post_launch_process = None
+        post_launch = recipe.get("post_launch", [])
+        if post_launch:
+            post_launch_cmd = list(post_launch)
+            executable = Path(post_launch_cmd[0]).expanduser()
+            if not executable.is_absolute():
+                executable = SCRIPT_DIR / executable
+            if not executable.exists():
+                print(f"Warning: Post-launch command not found: {executable}")
+            else:
+                post_launch_cmd[0] = str(executable)
+                print(f"Starting post-launch command: {' '.join(post_launch)}")
+                post_launch_process = subprocess.Popen(post_launch_cmd)
+
         result = subprocess.run(cmd)
+        if result.returncode != 0 and post_launch_process is not None:
+            post_launch_process.terminate()
+            post_launch_process.wait()
+        elif post_launch_process is not None:
+            post_launch_result = post_launch_process.wait()
+            if post_launch_result != 0:
+                print(
+                    f"Warning: Post-launch command exited with status "
+                    f"{post_launch_result}; the server remains running."
+                )
         return result.returncode
 
     finally:
