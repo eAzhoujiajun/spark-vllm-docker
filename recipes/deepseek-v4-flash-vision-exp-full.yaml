@@ -15,6 +15,7 @@ cluster_only: true
 
 mods:
   - mods/deepseek-v4-vision-exp
+  - mods/fix-deepseek-v4-tool-args-wrapper
 
 post_launch:
   - examples/warmup-deepseek-v4-prefill.sh
