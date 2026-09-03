@@ -1,8 +1,8 @@
 """Official DeepSeek-V4-Flash-Vision-Exp ViT + Aligner (pure PyTorch).
 
 Adapted from deepseek-ai/DeepSeek-V4-Flash-Vision-Exp ``inference/vision.py``
-(MIT) so it can load the checkpoint tensors in vLLM without the official
-custom kernels. RoPE tables are moved onto the activation device.
+(MIT) so it can load the checkpoint tensors on Anemll vLLM without the
+official custom kernels. RoPE tables are moved onto the activation device.
 """
 from __future__ import annotations
 

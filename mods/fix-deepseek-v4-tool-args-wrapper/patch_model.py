@@ -20,41 +20,62 @@ import re
 import sys
 from pathlib import Path
 
-MARKER = "# spark-vllm mod: fix-deepseek-v4-tool-args-wrapper v1"
+MARKER = "# spark-vllm mod: fix-deepseek-v4-tool-args-wrapper v2"
 
 # The wrapper-candidate loop in _unwrap_wrapper_args (deepseek_v4.py).
 WRAPPER_LOOP_RE = re.compile(
-    r'^( +)for wrapper in \("arguments", "input"\):$',
+    r'^( +)for wrapper in \("arguments", "input"(?:, "commands")?\):.*$',
     re.MULTILINE,
 )
 WRAPPER_LOOP_PATCH = (
-    '\\1for wrapper in ("arguments", "input", "commands"):'
+    '\\1for wrapper in ("arguments", "input", "commands", "parameters", "params", "kwargs", "args", "payload", "body", "tool_input"):'
     '  ' + MARKER
 )
 
-# The inner-dict acceptance check in the same function.
-DICT_CHECK_RE = re.compile(
-    r'^( +)if isinstance\(inner, dict\) and set\(inner\.keys\(\)\)\.issubset\(allowed\):$\n'
-    r'\1    return json\.dumps\(inner, ensure_ascii=False\)$',
+# The check for wrapper key and inner extraction/dict check in the same function.
+INNER_CHECK_RE = re.compile(
+    r'^( +)if set\(args\.keys\(\)\) != \{wrapper\} or wrapper in allowed:\n'
+    r'\1    continue\n'
+    r'\1inner = args\[wrapper\]\n'
+    r'(?:\1if isinstance\(inner, list\) and len\(inner\) == 1 and isinstance\(inner\[0\], dict\):\n'
+    r'\1    inner = inner\[0\]\n)?'
+    r'\1if isinstance\(inner, str\):\n'
+    r'\1    try:\n'
+    r'\1        inner = json\.loads\(inner\)\n'
+    r'\1    except json\.JSONDecodeError:\n'
+    r'\1        return args_json\n'
+    r'(?:\1if isinstance\(inner, list\) and len\(inner\) == 1 and isinstance\(inner\[0\], dict\):\n'
+    r'\1    inner = inner\[0\]\n)?'
+    r'\1if isinstance\(inner, dict\) and set\(inner\.keys\(\)\)\.issubset\(allowed\):\n'
+    r'\1    return json\.dumps\(inner, ensure_ascii=False\)',
     re.MULTILINE,
 )
-DICT_CHECK_PATCH = (
+INNER_CHECK_PATCH = (
+    '\\1if wrapper not in args or wrapper in allowed:\n'
+    '\\1    continue\n'
+    '\\1if set(args.keys()) != {wrapper} and any(k in allowed for k in args.keys()):\n'
+    '\\1    continue\n'
+    '\\1inner = args[wrapper]\n'
+    '\\1if isinstance(inner, str):\n'
+    '\\1    try:\n'
+    '\\1        inner = json.loads(inner)\n'
+    '\\1    except (json.JSONDecodeError, ValueError):\n'
+    '\\1        continue\n'
     '\\1if isinstance(inner, list) and len(inner) == 1 and isinstance(inner[0], dict):\n'
     '\\1    inner = inner[0]\n'
-    '\\1if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):\n'
-    '\\1    return json.dumps(inner, ensure_ascii=False)'
+    '\\1if isinstance(inner, dict):\n'
+    '\\1    if set(inner.keys()).issubset(allowed) or any(k in allowed for k in inner.keys()):\n'
+    '\\1        return json.dumps(inner, ensure_ascii=False)'
 )
 
 
 def patched_text(text: str) -> str:
     if MARKER in text:
-        # Already patched: verify both edits are present, reject stale anchors.
-        if WRAPPER_LOOP_RE.search(text) is not None:
-            raise ValueError("mod marker present but wrapper loop is unpatched")
-        if '"commands"' not in text or "len(inner) == 1" not in text:
-            raise ValueError("mod marker present but patch bodies missing")
         compile(text, "<patched deepseek_v4.py>", "exec")
         return text
+
+    # Strip older v1 marker if present
+    text = re.sub(r' *# spark-vllm mod: fix-deepseek-v4-tool-args-wrapper v1', '', text)
 
     loop_matches = list(WRAPPER_LOOP_RE.finditer(text))
     if len(loop_matches) != 1:
@@ -62,7 +83,7 @@ def patched_text(text: str) -> str:
             "expected exactly one supported wrapper loop in deepseek_v4.py; "
             f"found {len(loop_matches)}"
         )
-    dict_matches = list(DICT_CHECK_RE.finditer(text))
+    dict_matches = list(INNER_CHECK_RE.finditer(text))
     if len(dict_matches) != 1:
         raise ValueError(
             "expected exactly one supported inner-dict check in deepseek_v4.py; "
@@ -70,7 +91,7 @@ def patched_text(text: str) -> str:
         )
 
     text = WRAPPER_LOOP_RE.sub(WRAPPER_LOOP_PATCH, text, count=1)
-    text = DICT_CHECK_RE.sub(DICT_CHECK_PATCH, text, count=1)
+    text = INNER_CHECK_RE.sub(INNER_CHECK_PATCH, text, count=1)
     compile(text, "<patched deepseek_v4.py>", "exec")
     return text
 
