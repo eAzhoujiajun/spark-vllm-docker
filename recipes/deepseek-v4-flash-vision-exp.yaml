@@ -1,9 +1,16 @@
-# Recipe: DeepSeek V4 Flash Vision Exp (native image input)
-# Uses this repository's B12X image plus the Vision-Exp startup patch.
+# Recipe: DeepSeek V4 Flash Vision Exp
+# DeepSeek V4 Flash Vision (experimental) using the B12X-optimized serving stack
+# on an SM121 cluster. Same architecture family as DeepSeek-V4-Flash-0731
+# (deepseek_v4, fp8 block quant, embedded 3-layer DSpark draft) plus vision
+# modules. NOTE: the 20260823 b12x build has no vision implementation and its
+# weight loader raises on unknown keys, so mods/deepseek-v4-skip-vision-weights
+# skips the vision./aligner./image_ checkpoint tensors; the model serves
+# text-only (multimodal requests are rejected) until the image ships vision
+# support (upstream vLLM issue #54561).
 
 recipe_version: "1"
-name: DeepSeek-V4-Flash-Vision-Exp-Full
-description: vLLM serving DeepSeek-V4-Flash-Vision-Exp with native image_url support
+name: DeepSeek-V4-Flash-Vision-Exp
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-Vision-Exp on a dual Sparks using B12X docker
 
 model: /models/DeepSeek-V4-Flash-Vision-Exp
 container: vllm-node-b12x
@@ -14,40 +21,33 @@ build_args:
 cluster_only: true
 
 mods:
-  - mods/deepseek-v4-vision-exp
-  - mods/fix-deepseek-v4-tool-args-wrapper
+  - mods/deepseek-v4-skip-vision-weights
   - mods/instanttensor-hybrid-draft-loader
   - mods/fix-decode-topk-cache
-
-post_launch:
-  - examples/warmup-deepseek-v4-prefill.sh
+  - mods/fix-deepseek-v4-tool-args-wrapper
+#   - mods/drop-caches
 
 defaults:
   port: 8888
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.87
-  max_model_len: 400000
+  gpu_memory_utilization: 0.85
+  max_model_len: auto
   block_size: 256
-  max_num_seqs: 6
-  max_num_batched_tokens: 4096
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
   max_cudagraph_capture_size: 64
   num_speculative_tokens: 6
-  long_prefill_token_threshold: 2048
 
 env:
-  DEEPSEEK_VISION_MODEL_PATH: "/models/DeepSeek-V4-Flash-Vision-Exp"
   CUTE_DSL_ARCH: "sm_121a"
   VLLM_USE_AOT_COMPILE: "1"
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
   VLLM_USE_MEGA_AOT_ARTIFACT: "-1"
   VLLM_MEMORY_PROFILE_INCLUDE_ATTN: "1"
   VLLM_USE_FLASHINFER_SAMPLER: "1"
-  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
   VLLM_USE_B12X_WO_PROJECTION: "1"
-  # Vision-Exp profile/warmup hits b12x_mhc_pre split_k=64, which the fused
-  # Gram MHC kernel rejects; keep MHC off until B12X supports this shape.
-  VLLM_USE_B12X_MHC: "0"
+  VLLM_USE_B12X_MHC: "1"
   VLLM_USE_B12X_FP8_GEMM: "1"
   VLLM_USE_B12X_MOE: "1"
   VLLM_USE_B12X_SPARSE_INDEXER: "1"
@@ -56,6 +56,7 @@ env:
   B12X_MLA_SM120_UNIFIED: "1"
   B12X_MOE_FORCE_A8: "1"
   # fix-decode-topk-cache: replayed decode top-k steps between full rescans
+  # (0 disables the replay; default 32)
   VLLM_SPARSE_DECODE_REFRESH_INTERVAL: "32"
 
 command: |
@@ -65,6 +66,7 @@ command: |
       --port {port} \
       --trust-remote-code \
       --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
       --block-size {block_size} \
       --max-model-len {max_model_len} \
       --max-num-seqs {max_num_seqs} \
@@ -72,19 +74,14 @@ command: |
       --gpu-memory-utilization {gpu_memory_utilization} \
       --enable-prefix-caching \
       --enable-prompt-tokens-details \
-      --async-scheduling \
-      --enable-chunked-prefill \
       --tokenizer-mode deepseek_v4 \
-      --limit-mm-per-prompt '{{"image":40}}' \
       --tool-call-parser deepseek_v4 \
       --enable-auto-tool-choice \
       --reasoning-parser deepseek_v4 \
-      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
-      --default-chat-template-kwargs '{{"thinking":true,"reasoning_effort":"max"}}' \
-      --generation-config vllm \
-      --kv-cache-dtype fp8 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
       --load-format instanttensor \
-      --long-prefill-token-threshold {long_prefill_token_threshold} \
       --moe-backend b12x \
       --linear-backend b12x \
       --attention-backend B12X_MLA_SPARSE \
