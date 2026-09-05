@@ -5,7 +5,7 @@ recipe_version: "1"
 name: DeepSeek-V4-Flash-0731
 description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-0731 on a dual Sparks using B12X docker
 
-model: deepseek-ai/DeepSeek-V4-Flash-0731
+model: /models/DeepSeek-V4-Flash-0731
 container: vllm-node-b12x
 
 build_args:
@@ -47,7 +47,7 @@ env:
   B12X_MOE_FORCE_A8: "1"
 
 command: |
-  vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 \
+  vllm serve /models/DeepSeek-V4-Flash-0731 \
       --host {host} \
       --port {port} \
       --trust-remote-code \
