@@ -79,7 +79,7 @@ usage() {
     echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
     echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
     echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
-    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
+    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.cache/cute_dsl, ~/.triton, ~/.tilelang)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
     echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
     echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
@@ -417,6 +417,13 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # TileLang Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
     CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
+
+    # B12X / CuTeDSL JIT compile caches (runtime-compiled kernels)
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x:/root/.cache/b12x"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x")
+
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/cute_dsl:/root/.cache/cute_dsl"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/cute_dsl")
 fi
 
 # Pass user-provided mappings through unchanged so Docker handles its native
@@ -1295,7 +1302,7 @@ container_keepalive_command() {
 }
 
 # Verify that the selected image resolves to the same content-addressable image
-# ID on the head and every worker before starting any containers.
+# on the head and every worker before starting any containers.
 verify_cluster_image_consistency() {
     if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
         return 0
@@ -1303,32 +1310,42 @@ verify_cluster_image_consistency() {
 
     echo "Verifying Docker image consistency across cluster nodes..."
 
-    local head_image_id
-    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+    local image_inspect_format='{{.Id}}|{{.Created}}|{{range .RootFS.Layers}}{{.}};{{end}}'
+    local head_image_signature
+    if ! head_image_signature=$(docker image inspect --format "$image_inspect_format" "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_signature" ]]; then
         echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
         echo "       Make sure the image exists and is accessible to the current user."
         return 1
     fi
+    local head_image_id="${head_image_signature%%|*}"
+    local head_image_fingerprint="${head_image_signature#*|}"
     echo "  [HEAD] $HEAD_IP: $head_image_id"
 
     local inspect_cmd
-    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+    printf -v inspect_cmd "docker image inspect --format %q %q" "$image_inspect_format" "$IMAGE_NAME"
 
     local worker
-    local worker_image_id
+    local worker_image_signature
     local image_error=false
     for worker in "${PEER_NODES[@]}"; do
-        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+        if ! worker_image_signature=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_signature" ]]; then
             echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
             echo "       The image may be missing or inaccessible to the remote user."
             image_error=true
-        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            continue
+        fi
+
+        local worker_image_id="${worker_image_signature%%|*}"
+        local worker_image_fingerprint="${worker_image_signature#*|}"
+        if [[ "$worker_image_id" == "$head_image_id" ]]; then
+            echo "  [WORKER] $worker: $worker_image_id (match)"
+        elif [[ -n "$head_image_fingerprint" && "$worker_image_fingerprint" == "$head_image_fingerprint" ]]; then
+            echo "  [WORKER] $worker: $worker_image_id (RootFS match; Docker ID metadata differs)"
+        else
             echo "Error: Docker image mismatch on worker node ($worker):"
             echo "       Head:   $head_image_id"
             echo "       Worker: $worker_image_id"
             image_error=true
-        else
-            echo "  [WORKER] $worker: $worker_image_id (match)"
         fi
     done
 
