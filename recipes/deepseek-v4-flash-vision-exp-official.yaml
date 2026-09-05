@@ -28,7 +28,7 @@ defaults:
   max_num_seqs: 8
   max_num_batched_tokens: 8192
   max_cudagraph_capture_size: 48
-  num_speculative_tokens: 5
+  num_speculative_tokens: 6
 
 env:
   DEEPSEEK_VISION_MODEL_PATH: "/models/DeepSeek-V4-Flash-Vision-Exp"
