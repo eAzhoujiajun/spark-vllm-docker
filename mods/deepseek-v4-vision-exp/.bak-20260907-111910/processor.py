@@ -1,19 +1,10 @@
-"""vLLM multimodal processor for DeepSeek-V4-Flash-Vision-Exp.
+"""vLLM 0.25 multimodal processor for DeepSeek-V4-Flash-Vision-Exp.
 
 Images only. The checkpoint has no video encoder; GIF is a still frame via PIL.
-
-Adapted for the b12x serving stack (vLLM ``0.1.dev20489+ga50ebee1d``): that
-build has **no** ``_call_hf_processor`` dispatch hook.  Its
-``BaseMultiModalProcessor._apply_hf_processor_main`` calls
-``info.get_hf_processor(...)`` unconditionally whenever mm data is present and
-then invokes the returned object via ``ctx.call_hf_processor(...)``.  The
-checkpoint ships no HuggingFace processor, so instead of raising there we
-override ``_apply_hf_processor`` (the real engine-invoked entry) and build the
-``MultiModalProcessingInfo`` straight from the tokenized prompt and the image
-items, running the same tail the base would (``from_hf_inputs`` →
-``get_mm_hashes`` → ``_get_mm_prompt_updates``).
 """
 from __future__ import annotations
+
+import os
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -23,7 +14,7 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -33,10 +24,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     TimingContext,
 )
-# a50ebee1d does not re-export MultiModalProcessingInfo from the package
-# __init__ (it lives in vllm/multimodal/processing/processor.py:1023); import it
-# straight from the module so the mod loads on this b12x image.
-from vllm.multimodal.processing.processor import MultiModalProcessingInfo
 
 from .image_processor import (
     IMAGE_PAD,
@@ -90,9 +77,33 @@ def _salt_image_mm_hashes(hashes: Any, mm_kwargs: Any) -> Any:
     return out
 
 
+def _collect_images(mm_data: Mapping[str, object]) -> list[Any]:
+    for key in ("images", "image"):
+        value = mm_data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+    return []
+
+
 class DeepseekV4VisionExpProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        raw_limit = os.environ.get("LIMIT_MM_PER_PROMPT", "image=500")
+        if raw_limit.startswith("image="):
+            raw_limit = raw_limit[len("image=") :]
+        try:
+            image_limit = int(raw_limit)
+        except ValueError:
+            image_limit = 500
+        return {"image": max(0, image_limit)}
+
+    def get_hf_processor(self, **kwargs: object):
+        raise RuntimeError(
+            "DeepSeek-V4-Flash-Vision-Exp has no Hugging Face processor; "
+            "the vLLM Vision-Exp processor handles images directly."
+        )
 
     def get_max_image_tokens(self) -> int:
         return int(getattr(self.get_hf_config(), "vision_max_n_token", 384))
@@ -139,87 +150,40 @@ class DeepseekV4VisionExpMultiModalProcessor(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> MultiModalProcessingInfo:
+    ) -> tuple[list[int], Any, bool]:
         # compress_pad depends on the expanded token position of each image,
         # so a content-only processor cache would reuse the wrong layout.
         # The GPU encoder cache is also keyed by image bytes; salt hashes with
         # num_tokens so a 40×19 grid at start_pos%4==0 (125) cannot reuse a
         # block encoded at %4==1 (124). See issue #172.
         if inputs.mm_data_items.get_count("image", strict=False) > 0:
-            mm_info = self._apply_hf_processor(inputs, timing_ctx)
+            prompt_ids, mm_info, applied = self._apply_hf_processor(inputs, timing_ctx)
             salted = _salt_image_mm_hashes(mm_info.hashes, mm_info.kwargs)
             if salted is not mm_info.hashes:
                 mm_info = mm_info._replace(hashes=salted)
-            return mm_info
+            return prompt_ids, mm_info, applied
         return super()._cached_apply_hf_processor(inputs, timing_ctx)
 
-    def _apply_hf_processor(
+    def _call_hf_processor(
         self,
-        inputs: ProcessorInputs,
-        timing_ctx: TimingContext,
-    ) -> MultiModalProcessingInfo:
-        """Adapted entry for the b12x vLLM (no ``_call_hf_processor`` hook).
-
-        The stock ``_apply_hf_processor`` calls ``_apply_hf_processor_main``,
-        which unconditionally builds an HF processor here; this checkpoint has
-        none, so we bypass it and produce the mm kwargs directly.
-        """
-        with timing_ctx.record("apply_hf_processor"):
-            mm_processed_data = self._vision_process_prompt_and_images(inputs)
-
-        mm_kwargs = MultiModalKwargsItems.from_hf_inputs(
-            mm_processed_data,
-            self._get_mm_fields_config(
-                mm_processed_data, inputs.hf_processor_mm_kwargs
-            ),
-        )
-
-        # Same tail as the base _apply_hf_processor.
-        with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(
-                self.info.model_id,
-                self.info.ctx.get_mm_config().mm_hasher_algorithm,
-            )
-
-        mm_prompt_updates = self._get_mm_prompt_updates(
-            inputs.mm_data_items,
-            inputs.hf_processor_mm_kwargs,
-            mm_kwargs,
-        )
-
-        return MultiModalProcessingInfo(
-            kwargs=mm_kwargs,
-            hashes=mm_hashes,
-            prompt_updates=mm_prompt_updates,
-        )
-
-    def _vision_process_prompt_and_images(
-        self,
-        inputs: ProcessorInputs,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        """Build the BatchFeature straight from the tokenized prompt + images.
-
-        Mirrors the upstream ``_call_hf_processor`` body, but the prompt is the
-        already-tokenized ``ProcessorInputs.prompt`` (or tokenized on the fly
-        when a string arrives) and images come from ``mm_data_items``.
-        """
         tokenizer = self.info.get_tokenizer()
-        image_token_id = _image_token_id(tokenizer)
         encode = getattr(tokenizer, "encode", None)
-
-        prompt = inputs.prompt
-        if isinstance(prompt, str):
-            prompt_ids = list(encode(prompt, add_special_tokens=False))
-        else:
-            prompt_ids = list(prompt)
-
-        images = self._get_images(inputs.mm_data_items)
+        if encode is None:
+            raise RuntimeError("Vision-Exp processor requires tokenizer.encode")
+        prompt_ids = list(encode(prompt, add_special_tokens=False))
+        images = _collect_images(mm_data)
         if not images:
             return BatchFeature(
                 data={"input_ids": torch.tensor([prompt_ids], dtype=torch.long)}
             )
 
         args = vision_args_from_config(self.info.get_hf_config())
+        image_token_id = _image_token_id(tokenizer)
         max_tokens = args.vision_max_n_token
         pixel_rows: list[torch.Tensor] = []
         n_vit_h_rows: list[int] = []
@@ -297,21 +261,6 @@ class DeepseekV4VisionExpMultiModalProcessor(
                 "num_tokens": torch.tensor(num_token_rows, dtype=torch.int32),
             }
         )
-
-    @staticmethod
-    def _get_images(mm_items) -> list[Any]:
-        """Pull the decoded image items (PIL / HWC-CHW array / tensor / dict)."""
-        from vllm.multimodal.parse import ImageProcessorItems
-
-        try:
-            items = mm_items.get_items("image", ImageProcessorItems)
-        except Exception:
-            # Fall back to the low-level typed container when the sheet is
-            # constructed lazily and typing conversion fails.
-            return [mm_items["image"].get(i)
-                    for i in range(mm_items["image"].get_count())]
-        out = [items.get(idx) for idx in range(items.get_count())]
-        return [item for item in out if item is not None]
 
     def _get_mm_fields_config(
         self,

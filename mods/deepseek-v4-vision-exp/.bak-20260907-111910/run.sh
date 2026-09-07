@@ -64,21 +64,6 @@ if [[ -f "$MOD_DIR/hotfix-dsv4-assistant-final-continuation.py" ]]; then
     python3 "$MOD_DIR/hotfix-dsv4-assistant-final-continuation.py" "$ENCODING_TARGET" || true
 fi
 
-# repo1 trap #7: vLLM caches model inspection on disk keyed by module+class.
-# Both the per-boot cache and the persistent /models-mounted cache would keep
-# DeepseekV4ForCausalLM supports_multimodal:false across container recreation.
-# Clear after the class interface changes (SupportsMultiModal / processor).
-for cache_dir in \
-    "$PYTHON_ROOT/../cache/vllm/modelinfos" \
-    "$HOME/.cache/vllm/modelinfos" \
-    "/models/vllm-cache/modelinfos"; do
-    if [[ -d "$cache_dir" ]]; then
-        rm -f "$cache_dir"/*DeepseekV4ForCausalLM*.json 2>/dev/null || true
-        rm -f "$cache_dir"/*DeepSeekV4MTP*.json 2>/dev/null || true
-        echo "$PREFIX cleared modelinfos cache at $cache_dir"
-    fi
-done
-
 find "$PYTHON_ROOT/vllm" "$PATCH_ROOT/vision_exp" \
     \( -name "__pycache__" -o -name "*.pyc" \) -exec rm -rf {} + 2>/dev/null || true
 

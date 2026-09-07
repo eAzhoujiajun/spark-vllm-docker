@@ -1,0 +1,137 @@
+# Recipe: DeepSeek V4 Flash Vision Exp (native image input) — combined port
+#
+# Native vLLM image_url support for /models/DeepSeek-V4-Flash-Vision-Exp on
+# the b12x serving stack (vllm-node-b12x, a50ebee1d). The vision mod
+# (mods/deepseek-v4-vision-exp) is a combination of the two upstream DGX Spark
+# implementations:
+#   * tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark
+#     (tower/aligner numerics, modelinfos-cache discipline)
+#   * MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark
+#     (processor + apply monkey-patch, bias_vl routing, hash salt)
+#
+# === PARITY WITH THE DEPLOYED deepseek-v4-flash-0731 ON THE 106 SERVER ===
+# This recipe mirrors the CURRENTLY-DEPLOYED 0731 config on 192.168.1.106
+# (`official` branch, with local edits), NOT the Mac checkout copy. The 106
+# deployed 0731 differs from the Mac copy: gpu_memory_utilization 0.835,
+# max_model_len 600000, max_num_batched_tokens 4096, max_cudagraph_capture_size
+# 48, VLLM_USE_MEGA_AOT_ARTIFACT "1", --attention-backend B12X (not
+# B12X_MLA_SPARSE), --long-prefill-token-threshold 2048, no
+# --enable-prompt-tokens-details, and mods = instanttensor-hybrid-draft-loader
+# only. Every non-vision setting below is copied verbatim from that deployed
+# 0731.
+#
+# Vision-only deltas over deployed 0731 (nothing else differs):
+#   * mods/deepseek-v4-vision-exp      — native vision tower/aligner/processor.
+#   * mods/b12x-mhc-eps-gate           — Vision-Exp rms_norm_eps=1e-20 (0731 is
+#     1e-6) trips the fused Gram MHC gate; relaxes it so the fused mHC path
+#     stays on with VLLM_USE_B12X_MHC=1.
+#   * --limit-mm-per-prompt '{"image":8}' + image prompt handling.
+#   * num_speculative_tokens: 6        — THE ONE VALUE THAT DIFFERS from 0731's
+#     k=5. Vision-Exp ships num_nextn_predict_layers=3, so DSpark k MUST be a
+#     multiple of 3 (0/3/6/9); k=5 trips the pydantic ValidationError
+#     "num_speculative_tokens must be divisible by n_predict" (the 9/5 launch
+#     failure). k=6 is the smallest safe value, keeping dspark speculative
+#     decoding active on the same B12X backend.
+#   * DEEPSEEK_VISION_MODEL_PATH env + model path/served-model-name (this
+#     recipe serves the Vision-Exp checkpoint instead of 0731).
+#
+# Deployment is a separate container/recipe from the text 0731 recipe; start
+# and stop are mutually exclusive (launch-cluster.sh stop then run this recipe).
+# The text 0731 recipe/container is never modified by this recipe.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-Vision-Exp
+description: vLLM serving /models/DeepSeek-V4-Flash-Vision-Exp with native image_url support (combined upstream port, b12x stack)
+
+model: /models/DeepSeek-V4-Flash-Vision-Exp
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+mods:
+  # Native vision: tower + aligner + processor + DSpark/moe bias_vl handling
+  # (vision-required addition over the 0731 mod set).
+  - mods/deepseek-v4-vision-exp
+  # Vision-Exp rms_norm_eps=1e-20 vs 0731 1e-6: relax the fused Gram MHC gate so
+  # VLLM_USE_B12X_MHC=1 (a 0731 setting) works on this checkpoint
+  # (vision-required addition).
+  - mods/b12x-mhc-eps-gate
+  # Loaded verbatim from the deployed 0731 recipe (its only mod).
+  - mods/instanttensor-hybrid-draft-loader
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # verbatim 0731: 0.835 (NOT the Mac copy's 0.85)
+  gpu_memory_utilization: 0.835
+  # verbatim 0731: 600000 (NOT auto as in the Mac copy)
+  max_model_len: 600000
+  block_size: 256
+  max_num_seqs: 8
+  # verbatim 0731: 4096 (NOT 8192)
+  max_num_batched_tokens: 4096
+  # verbatim 0731: 48
+  max_cudagraph_capture_size: 48
+  # 6 = 0731's k=5 rerouted to the smallest value Vision-Exp accepts
+  # (num_nextn_predict_layers=3 forces k % 3 == 0). Only value that differs.
+  num_speculative_tokens: 6
+
+env:
+  # vision-only env (read by mods/deepseek-v4-vision-exp/run.sh:7).
+  DEEPSEEK_VISION_MODEL_PATH: "/models/DeepSeek-V4-Flash-Vision-Exp"
+  # Everything below is verbatim from the deployed 106 0731 (incl
+  # VLLM_USE_MEGA_AOT_ARTIFACT=1, which the Mac copy mistakenly had as -1; and
+  # NO VLLM_SPARSE_DECODE_REFRESH_INTERVAL because 106 0731 drops the
+  # fix-decode-topk-cache mod).
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_MEMORY_PROFILE_INCLUDE_ATTN: "1"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_USE_B12X_WO_PROJECTION: "1"
+  # Vision-Exp rms_norm_eps=1e-20: b12x-mhc-eps-gate relaxes the fused Gram MHC
+  # gate so the fused mHC path can stay on.
+  VLLM_USE_B12X_MHC: "1"
+  VLLM_USE_B12X_FP8_GEMM: "1"
+  VLLM_USE_B12X_MOE: "1"
+  VLLM_USE_B12X_SPARSE_INDEXER: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_MOE_SKIP_PADDING: "0"
+  B12X_MLA_SM120_UNIFIED: "1"
+  B12X_MOE_FORCE_A8: "1"
+
+command: |
+  vllm serve /models/DeepSeek-V4-Flash-Vision-Exp \
+      --host {host} \
+      --port {port} \
+      --served-model-name deepseek-v4-flash-vision-exp \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --long-prefill-token-threshold 2048 \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --tokenizer-mode deepseek_v4 \
+      --limit-mm-per-prompt '{{"image":500}}' \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format instanttensor \
+      --moe-backend b12x \
+      --linear-backend b12x \
+      --attention-backend B12X \
+      --max-cudagraph-capture-size {max_cudagraph_capture_size} \
+      --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X"}}'

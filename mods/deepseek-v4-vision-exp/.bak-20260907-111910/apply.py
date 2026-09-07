@@ -14,10 +14,9 @@ from torch import nn
 from .image_processor import (
     IMAGE,
     IMAGE_TOKEN_ID,
-    current_routing_kind,
     is_unregistered_router_bias,
     is_vision_exp_weight_name,
-    routing_kind_from_mm,
+    token_routing_kind,
     vision_args_from_config,
 )
 from .processor import IMAGE_PLACEHOLDER, register_vision_exp_processor
@@ -153,8 +152,6 @@ def fused_topk_bias_split_vl(
     input_tokens: Any,
     hash_indices_table: Any,
     routed_scaling_factor: float,
-    kind: Any = None,
-    kind_cell: Any = None,
 ) -> tuple[Any, Any]:
     """Route image placeholder rows with bias_vl and no hash table (issue #175)."""
     from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -176,8 +173,7 @@ def fused_topk_bias_split_vl(
         )
 
     vl = _bias_data(e_score_correction_bias_vl)
-    if kind is None:
-        kind = current_routing_kind(input_tokens, kind_cell=kind_cell)
+    kind = token_routing_kind(input_tokens)
     if vl is None or kind == "text":
         return _call(
             hidden_states,
@@ -256,8 +252,9 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
         hidden_states,
         router_logits,
         indices_type,
-        *,
+        *args,
         input_ids=None,
+        **kwargs,
     ):
         vl = getattr(gate, "e_score_correction_bias_vl", None)
         # Graph capture cannot .item() / host-branch on token ids (issue #175).
@@ -267,18 +264,14 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
             capturing = bool(torch.cuda.is_current_stream_capturing())
         except Exception:
             capturing = False
-        # Order matters: capture must never resolve a kind (no host sync,
-        # no .item()) -- decode graphs only ever replay text tokens.
-        if vl is None or capturing:
+        if vl is None or capturing or token_routing_kind(input_ids) == "text":
             return orig(
-                hidden_states, router_logits, indices_type, input_ids=input_ids
-            )
-        kind = current_routing_kind(
-            input_ids, kind_cell=getattr(router, "_dspark_routing_kind_cell", None)
-        )
-        if kind == "text":
-            return orig(
-                hidden_states, router_logits, indices_type, input_ids=input_ids
+                hidden_states,
+                router_logits,
+                indices_type,
+                *args,
+                input_ids=input_ids,
+                **kwargs,
             )
         topk_weights, topk_ids = fused_topk_bias_split_vl(
             hidden_states=hidden_states,
@@ -292,7 +285,6 @@ def _wrap_router_compute_routing(router: Any, gate: Any) -> None:
             input_tokens=input_ids,
             hash_indices_table=getattr(router, "_hash_indices_table", None),
             routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
-            kind=kind,
         )
         return _append_fused_shared_experts(router, topk_weights, topk_ids)
 
@@ -329,91 +321,6 @@ def embed_multimodal(self, **kwargs: object):
     return out
 
 
-def attach_routing_kind_cell(root: nn.Module, kind_cell: list[Any]) -> int:
-    """Share one model-local publication cell with its Vision-Exp MoE gates."""
-    attached = 0
-    for mod in root.modules():
-        gate = getattr(mod, "gate", None)
-        if gate is None or getattr(gate, "e_score_correction_bias_vl", None) is None:
-            continue
-        mod._dspark_routing_kind_cell = kind_cell
-        router = getattr(getattr(mod, "experts", None), "router", None)
-        if router is not None:
-            router._dspark_routing_kind_cell = kind_cell
-        attached += 1
-    return attached
-
-
-def _num_tokens(input_ids: Any) -> int:
-    """Row count of a token tensor. ``numel`` is metadata: no host sync.
-
-    Never guesses: a 0 here would make any non-empty placeholder count look
-    like a full-image batch.
-    """
-    if hasattr(input_ids, "numel"):
-        return int(input_ids.numel())
-    try:
-        return len(input_ids)
-    except TypeError as exc:
-        raise TypeError(
-            f"Vision-Exp cannot size input_ids of type {type(input_ids).__name__}"
-        ) from exc
-
-
-def make_embed_input_ids(orig_lm_embed):
-    """Wrap the stock ``embed_input_ids`` and classify the batch once (#175).
-
-    This runs once per forward, ahead of every MoE layer, and already knows
-    whether the step carries multimodal embeddings -- so a text-only step is
-    classified with zero device->host syncs.
-    """
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Any = None,
-        *,
-        is_multimodal: Any = None,
-    ):
-        # Default for every early return below: no mm embeddings == text.
-        self._dspark_routing_kind_cell[0] = "text"
-        text_embeds = orig_lm_embed(self, input_ids)
-        if multimodal_embeddings is None:
-            return text_embeds
-        try:
-            empty = len(multimodal_embeddings) == 0
-        except TypeError:
-            empty = False
-        if empty:
-            return text_embeds
-        from vllm.model_executor.models.interfaces import _require_is_multimodal
-        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-
-        is_mm = _require_is_multimodal(is_multimodal)
-        n_placeholders = (
-            int(is_mm.sum().item()) if hasattr(is_mm, "sum") else int(is_mm)
-        )
-        n_embeds = _mm_embed_rows(multimodal_embeddings)
-        if n_placeholders != n_embeds:
-            raise ValueError(
-                "Vision-Exp placeholder/embedding mismatch: "
-                f"{n_embeds} multimodal tokens vs {n_placeholders} placeholders. "
-                "Image block length depends on start_pos%4; a content-only encoder "
-                "cache hit can reuse the wrong compress_pad (issue #172)."
-            )
-        # Reuses the sum above: the image path stays at one sync per forward.
-        self._dspark_routing_kind_cell[0] = routing_kind_from_mm(
-            n_placeholders, _num_tokens(input_ids)
-        )
-        return _merge_multimodal_embeddings(
-            inputs_embeds=text_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_mm,
-        )
-
-    return embed_input_ids
-
-
 @classmethod
 def get_placeholder_str(cls, modality: str, i: int) -> str | None:
     if modality.startswith("image"):
@@ -433,9 +340,11 @@ def apply_vision_exp(
 
     orig_model_init = DeepseekV4Model.__init__
 
-    def model_init(self, *, vllm_config, prefix: str = ""):
-        orig_model_init(self, vllm_config=vllm_config, prefix=prefix)
-        _install_vision_tower(self, vllm_config.model_config.hf_config)
+    def model_init(self, vllm_config, prefix: str = "", *args, **kwargs):
+        orig_model_init(self, vllm_config=vllm_config, prefix=prefix, *args, **kwargs)
+        config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        if config is not None:
+            _install_vision_tower(self, config)
 
     DeepseekV4Model.__init__ = model_init
     DeepseekV4Model.encode_image = lambda self, patches, n_h, n_w: encode_image(
@@ -481,17 +390,10 @@ def apply_vision_exp(
 
     orig_moe_init = DeepseekV4MoE.__init__
 
-    def moe_init(self, vllm_config, prefix: str = "", use_sequence_parallel: bool = False):
-        # a50ebee1d stock MoE __init__ is (self, vllm_config, prefix="",
-        # use_sequence_parallel=False); the DecoderLayer builds
-        # DeepseekV4MoE(..., use_sequence_parallel=self.use_sequence_parallel)
-        # and self.use_sequence_parallel drives kernel config, so it must be
-        # forwarded verbatim (not dropped).
-        orig_moe_init(
-            self, vllm_config, prefix, use_sequence_parallel=use_sequence_parallel
-        )
-        config = vllm_config.model_config.hf_config
-        if getattr(config, "vision_n_layers", 0) > 0:
+    def moe_init(self, vllm_config, prefix: str = "", *args, **kwargs):
+        orig_moe_init(self, vllm_config, prefix, *args, **kwargs)
+        config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        if config is not None and getattr(config, "vision_n_layers", 0) > 0:
             self.gate.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
@@ -505,28 +407,26 @@ def apply_vision_exp(
 
     orig_moe_forward = DeepseekV4MoE.forward
 
-    def moe_forward(self, hidden_states, input_ids=None):
+    def moe_forward(self, *args, **kwargs):
         vl = getattr(getattr(self, "gate", None), "e_score_correction_bias_vl", None)
         if not getattr(self, "use_mega_moe", False) or vl is None:
-            return orig_moe_forward(self, hidden_states, input_ids)
+            return orig_moe_forward(self, *args, **kwargs)
         import vllm.models.deepseek_v4.nvidia.model as nvidia_mod
 
         prev = nvidia_mod.fused_topk_bias
 
-        def _split_ftb(*args, **kwargs):
-            if args:
+        def _split_ftb(*a, **kw):
+            if a:
                 raise TypeError(
                     "issue #175 mega-MoE wrap expects fused_topk_bias keyword args"
                 )
             return fused_topk_bias_split_vl(
-                e_score_correction_bias_vl=vl,
-                kind_cell=getattr(self, "_dspark_routing_kind_cell", None),
-                **kwargs,
+                e_score_correction_bias_vl=vl, **kw
             )
 
         nvidia_mod.fused_topk_bias = _split_ftb
         try:
-            return orig_moe_forward(self, hidden_states, input_ids)
+            return orig_moe_forward(self, *args, **kwargs)
         finally:
             nvidia_mod.fused_topk_bias = prev
 
@@ -534,18 +434,9 @@ def apply_vision_exp(
 
     orig_lm_init = DeepseekV4ForCausalLM.__init__
 
-    def lm_init(self, *, vllm_config, prefix: str = ""):
-        orig_lm_init(self, vllm_config=vllm_config, prefix=prefix)
+    def lm_init(self, *, vllm_config, prefix: str = "", **kwargs):
+        orig_lm_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
         self.hf_to_vllm_mapper = _extend_weights_mapper(self.hf_to_vllm_mapper)
-        self._dspark_routing_kind_cell = [None]
-        attached = attach_routing_kind_cell(self, self._dspark_routing_kind_cell)
-        if getattr(vllm_config.model_config.hf_config, "vision_n_layers", 0) > 0:
-            if attached == 0:
-                raise RuntimeError(
-                    "Vision-Exp found no bias_vl MoE gate to bind to this model; "
-                    "the per-forward routing kind would never be consumed and "
-                    "every gate would host-sync again (issue #175)"
-                )
 
     DeepseekV4ForCausalLM.__init__ = lm_init
     DeepseekV4ForCausalLM.hf_to_vllm_mapper = _extend_weights_mapper(
@@ -554,7 +445,43 @@ def apply_vision_exp(
 
     orig_lm_embed = DeepseekV4ForCausalLM.embed_input_ids
 
-    DeepseekV4ForCausalLM.embed_input_ids = make_embed_input_ids(orig_lm_embed)
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        *args,
+        is_multimodal: Any = None,
+        **kwargs,
+    ):
+        text_embeds = orig_lm_embed(self, input_ids, *args, **kwargs)
+        if multimodal_embeddings is None:
+            return text_embeds
+        try:
+            empty = len(multimodal_embeddings) == 0
+        except TypeError:
+            empty = False
+        if empty:
+            return text_embeds
+        from vllm.model_executor.models.interfaces import _require_is_multimodal
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        is_mm = _require_is_multimodal(is_multimodal)
+        n_placeholders = int(is_mm.sum().item()) if hasattr(is_mm, "sum") else int(is_mm)
+        n_embeds = _mm_embed_rows(multimodal_embeddings)
+        if n_placeholders != n_embeds:
+            raise ValueError(
+                "Vision-Exp placeholder/embedding mismatch: "
+                f"{n_embeds} multimodal tokens vs {n_placeholders} placeholders. "
+                "Image block length depends on start_pos%4; a content-only encoder "
+                "cache hit can reuse the wrong compress_pad (issue #172)."
+            )
+        return _merge_multimodal_embeddings(
+            inputs_embeds=text_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_mm,
+        )
+
+    DeepseekV4ForCausalLM.embed_input_ids = embed_input_ids
 
     if SupportsMultiModal not in DeepseekV4ForCausalLM.__mro__:
         DeepseekV4ForCausalLM.__bases__ = (

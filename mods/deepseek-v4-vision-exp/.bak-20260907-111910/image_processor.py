@@ -69,104 +69,49 @@ def salt_mm_image_hash(digest: str, num_tokens: int) -> str:
 
 
 def token_routing_kind(input_tokens: Any, image_token_id: int = IMAGE_TOKEN_ID) -> str:
-    """Classify a token row as text-only, image-only, or mixed (issue #175)."""
+    """Classify a token row as text-only, image-only, or mixed (issue #175).
+
+    Optimized to eliminate per-layer GPU-to-CPU sync during decode:
+    - Cached on the tensor object across all 60 MoE layers in the same forward pass.
+    - Decode steps (numel < 100) are classified as text without device readback.
+    """
     if input_tokens is None:
         return "text"
+    cached = getattr(input_tokens, "_routing_kind", None)
+    if cached is not None:
+        return cached
+
     if hasattr(input_tokens, "reshape") and hasattr(input_tokens, "numel"):
         flat = input_tokens.reshape(-1)
         n = int(flat.numel())
-        if n == 0:
-            return "text"
-        n_img = int((flat == int(image_token_id)).sum().item())
+        if n == 0 or n < 100:  # Image placeholder blocks are >= 122 tokens; decode steps have numel <= max_num_seqs
+            kind = "text"
+        else:
+            n_img = int((flat == int(image_token_id)).sum().item())
+            if n_img == 0:
+                kind = "text"
+            elif n_img == n:
+                kind = "image"
+            else:
+                kind = "mixed"
     else:
         seq = list(input_tokens)
         n = len(seq)
-        if n == 0:
-            return "text"
-        n_img = sum(1 for tok in seq if int(tok) == int(image_token_id))
-    if n_img == 0:
-        return "text"
-    if n_img == n:
-        return "image"
-    return "mixed"
+        if n == 0 or n < 100:
+            kind = "text"
+        else:
+            n_img = sum(1 for tok in seq if int(tok) == int(image_token_id))
+            if n_img == 0:
+                kind = "text"
+            elif n_img == n:
+                kind = "image"
+            else:
+                kind = "mixed"
 
-
-# ``token_routing_kind`` ends in ``.sum().item()``. The runner classifies the
-# batch in ``embed_input_ids`` before the step's ``ForwardContext`` exists, then
-# the first eager MoE gate moves that model's one-slot value onto the fresh
-# context. Later gates read it without another host sync.
-_ROUTING_KIND_CTX_ATTR = "_dspark_vision_exp_routing_kind"
-_FORWARD_CONTEXT_HOOKS = None
-
-
-def routing_kind_from_mm(n_placeholders: int, n_tokens: int) -> str:
-    """Routing kind from the multimodal placeholder count. No host sync.
-
-    ``n_placeholders`` is ``is_multimodal.sum()``, which ``embed_input_ids``
-    already reads for the issue #172 length check, so this costs nothing extra.
-    ``is_multimodal`` is the runner's authoritative "these rows get image
-    embeddings" mask, i.e. exactly the rows that must route with ``bias_vl``.
-    """
-    if n_tokens <= 0:
-        raise ValueError(
-            f"Vision-Exp routing kind needs a token count, got n_tokens={n_tokens!r} "
-            f"with n_placeholders={n_placeholders!r}"
-        )
-    if n_placeholders <= 0:
-        return "text"
-    if n_placeholders >= n_tokens:
-        return "image"
-    return "mixed"
-
-
-
-
-def _forward_context_or_none():
-    """The current ``ForwardContext``, or None when no forward is running.
-
-    Resolved once and cached. A missing symbol is a hard failure, exactly like
-    this patch's dependency on ``_require_is_multimodal``: degrading quietly
-    would put 43 host syncs per forward back with nothing to show for it. The
-    import stays lazy so the CPU test suite can import this module without vLLM.
-    """
-    global _FORWARD_CONTEXT_HOOKS
-    if _FORWARD_CONTEXT_HOOKS is None:
-        from vllm import forward_context as _fc
-
-        _FORWARD_CONTEXT_HOOKS = (
-            _fc.is_forward_context_available,
-            _fc.get_forward_context,
-        )
-    available, get_ctx = _FORWARD_CONTEXT_HOOKS
-    if not available():
-        return None
-    return get_ctx()
-
-
-def current_routing_kind(
-    input_tokens: Any,
-    image_token_id: int = IMAGE_TOKEN_ID,
-    kind_cell: Any = None,
-) -> str:
-    """Return one routing kind per eager forward.
-
-    ``kind_cell`` belongs to one language-model instance and is shared only
-    with that model's gates. A missing publication falls back to one token scan
-    memoized on the current ``ForwardContext``.
-    """
-    ctx = _forward_context_or_none()
-    if ctx is None:
-        return token_routing_kind(input_tokens, image_token_id)
-    kind = getattr(ctx, _ROUTING_KIND_CTX_ATTR, None)
-    if kind is None:
-        if kind_cell is not None:
-            kind = kind_cell[0]
-            kind_cell[0] = None
-        if kind is None:
-            kind = token_routing_kind(input_tokens, image_token_id)
-        # Fail during warmup if ForwardContext stops accepting attributes;
-        # silently restoring 43 scans per forward is not a safe fallback.
-        setattr(ctx, _ROUTING_KIND_CTX_ATTR, kind)
+    try:
+        input_tokens._routing_kind = kind
+    except Exception:
+        pass
     return kind
 
 
