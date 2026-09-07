@@ -25,7 +25,7 @@
 #   * mods/b12x-mhc-eps-gate           — Vision-Exp rms_norm_eps=1e-20 (0731 is
 #     1e-6) trips the fused Gram MHC gate; relaxes it so the fused mHC path
 #     stays on with VLLM_USE_B12X_MHC=1.
-#   * --limit-mm-per-prompt '{"image":8}' + image prompt handling.
+#   * --limit-mm-per-prompt '{"image":500}' + image prompt handling.
 #   * num_speculative_tokens: 6        — THE ONE VALUE THAT DIFFERS from 0731's
 #     k=5. Vision-Exp ships num_nextn_predict_layers=3, so DSpark k MUST be a
 #     multiple of 3 (0/3/6/9); k=5 trips the pydantic ValidationError
@@ -62,12 +62,29 @@ mods:
   # Loaded verbatim from the deployed 0731 recipe (its only mod).
   - mods/instanttensor-hybrid-draft-loader
 
+# Warm the serving stack once it comes up, before real traffic. Combined from
+# both upstream implementations:
+#   * tonyd2wild: prefill write-side warmup (the engine runs ~30% slow right
+#     after boot / ~30 min idle), then the request-shape sweep. The container
+#     runs the prefill sweeps (it owns the API loopback + tokenizer), then the
+#     host runs boot-shape-warmup.sh (BLOCK ladder, chat/sampling arms, and one
+#     image_url arm) so no request JITs mid-serve (MiaAI-Lab issue #117; the
+#     600 s NCCL watchdog hazard on TP=2).
+#   * MiaAI-Lab: wait-for-health + concurrency handoff + the sampler-cache
+#     postcondition; boot-shape failures are WARN, never a boot failure.
+# Runs as a parallel host process (run-recipe.py post_launch); warmup gaps only
+# degrade to a mid-serve JIT, not to a failed launch. Set WARMUP_MAX_CONCURRENCY
+# to override (defaults to MAX_NUM_SEQS, here 8). This is the ONE boot-time
+# behaviour the vision recipe adds over the deployed 0731 (which has none).
+post_launch:
+  - examples/warmup-deepseek-v4-prefill.sh
+
 defaults:
   port: 8888
   host: 0.0.0.0
   tensor_parallel: 2
   # verbatim 0731: 0.835 (NOT the Mac copy's 0.85)
-  gpu_memory_utilization: 0.835
+  gpu_memory_utilization: 0.815
   # verbatim 0731: 600000 (NOT auto as in the Mac copy)
   max_model_len: 600000
   block_size: 256
@@ -83,6 +100,14 @@ defaults:
 env:
   # vision-only env (read by mods/deepseek-v4-vision-exp/run.sh:7).
   DEEPSEEK_VISION_MODEL_PATH: "/models/DeepSeek-V4-Flash-Vision-Exp"
+  # Warmup cold-JIT protection (tonyd2wild ds4-vision-tp2.sh, issue #8): the
+  # boot-time warmup sweep compiles cold Triton/deepgemm kernels; vLLM's default
+  # 300 s inference-time RPC deadline can strand a rank in a collective past
+  # torch's 600 s NCCL watchdog and shut the engine down mid-warmup. These raise
+  # the ready + first-execute deadlines so the warmup's first-ever compiles have
+  # room. Post-warmup the values are inert (no effect on steady-state perf).
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
   # Everything below is verbatim from the deployed 106 0731 (incl
   # VLLM_USE_MEGA_AOT_ARTIFACT=1, which the Mac copy mistakenly had as -1; and
   # NO VLLM_SPARSE_DECODE_REFRESH_INTERVAL because 106 0731 drops the
