@@ -26,8 +26,8 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.85
-  max_model_len: 262144
+  gpu_memory_utilization: 0.87
+  max_model_len: 1048576
   max_num_seqs: 8
   max_num_batched_tokens: 8192
   num_speculative_tokens: 7
@@ -40,6 +40,9 @@ env: {}
 #   sm_121; Marlin is the tested path for these experts.
 # - Hybrid 192/128 K/V head dims make the target select the *_DIFFKV attention
 #   backends (Triton on sm_121, where FlashAttention has no sink support).
+# - fp8 KV cache + 0.87 utilization: bf16 KV holds ~614K tokens at 0.85, short
+#   of the model's 1M context. A 1M sequence needs 14.3 GiB of fp8 KV; 0.85
+#   left 13.85 GiB, so 0.87 provides the headroom (~105.8 of 121.6 GiB).
 # - DFlash drafter ships inside the checkpoint under dflash/ (block size 8 ->
 #   7 draft tokens). Its SWA layers carry attention sink biases and DFlash needs
 #   non-causal attention, so the draft is pinned to TRITON_ATTN.
@@ -55,6 +58,7 @@ command: |
       --tensor-parallel-size {tensor_parallel} \
       --moe-backend marlin \
       --max-model-len {max_model_len} \
+      --kv-cache-dtype fp8 \
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
